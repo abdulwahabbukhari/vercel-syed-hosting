@@ -1,6 +1,8 @@
 import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
+import cookieParser from 'cookie-parser'; // ADDED: needed to populate req.cookies (was undefined before)
+import jwt from 'jsonwebtoken'; // ADDED: replaces in-memory Map() sessions with stateless, Vercel-safe auth
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -8,10 +10,15 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
+// FIX: Secret used to sign session JWTs. Falls back to a default only for local/dev
+// convenience; in production set JWT_SECRET in Vercel env vars so tokens can't be forged.
+const JWT_SECRET = process.env.JWT_SECRET || 'syed-hosting-dev-secret-change-me';
+
 // Middleware
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
+app.use(cookieParser()); // FIX: parses the "session" cookie into req.cookies (this was missing, so req.cookies was always undefined)
 
 // Data storage path
 const dataPath = '/tmp/syed-hosting-data';
@@ -46,8 +53,23 @@ function saveUsers(users) {
   fs.writeFileSync(usersFile, JSON.stringify(users, null, 2));
 }
 
-// Session storage (in-memory for Vercel)
-const sessions = new Map();
+// FIX: Removed in-memory `sessions` Map(). On Vercel, each serverless invocation can run in a
+// fresh/cold instance (or a different instance than the one that handled login), so anything
+// stored only in process memory disappears — that's exactly why "login then refresh" was kicking
+// users back to /login. Session state now lives entirely inside a signed JWT stored in the cookie,
+// which works identically across cold starts and across serverless instances.
+
+function createSessionToken(username, role) {
+  return jwt.sign({ username, role }, JWT_SECRET, { expiresIn: '24h' });
+}
+
+function verifySessionToken(token) {
+  try {
+    return jwt.verify(token, JWT_SECRET); // returns { username, role, iat, exp } or throws
+  } catch {
+    return null;
+  }
+}
 
 // Routes
 app.get('/', (req, res) => {
@@ -181,15 +203,18 @@ app.post('/api/login', (req, res) => {
   const users = loadUsers();
 
   if (users[username] && users[username].password === password) {
-    const sessionId = Math.random().toString(36).substring(7);
-    sessions.set(sessionId, { username, role: users[username].role });
-    
-    res.cookie('session', sessionId, { 
-      httpOnly: true, 
+    // FIX: session is now a signed JWT (contains username + role) instead of a random id
+    // that pointed into the in-memory Map(). The token itself is self-contained, so any
+    // serverless instance can verify it without shared memory.
+    const token = createSessionToken(username, users[username].role);
+
+    res.cookie('session', token, {
+      httpOnly: true,
       maxAge: 24 * 60 * 60 * 1000,
-      sameSite: 'strict'
+      sameSite: 'lax', // FIX: 'strict' can drop the cookie on the redirect Vercel does after POST /api/login in some browsers; 'lax' still blocks CSRF from third-party sites but survives the same-site redirect/refresh flow
+      secure: process.env.NODE_ENV === 'production' // FIX: ensures cookie is only sent over HTTPS in production (Vercel), required for cookies to reliably persist in modern browsers
     });
-    
+
     res.redirect('/admin');
   } else {
     res.status(401).send(`
@@ -210,8 +235,8 @@ app.post('/api/login', (req, res) => {
 });
 
 app.get('/admin', (req, res) => {
-  const sessionId = req.cookies?.session;
-  const session = sessions.get(sessionId);
+  const token = req.cookies?.session; // FIX: req.cookies now actually populated thanks to cookie-parser
+  const session = token ? verifySessionToken(token) : null; // FIX: verify JWT instead of Map() lookup that lost data on cold start
 
   if (!session || session.role !== 'admin') {
     return res.redirect('/login');
@@ -337,8 +362,8 @@ app.get('/admin', (req, res) => {
 });
 
 app.post('/api/update-credentials', (req, res) => {
-  const sessionId = req.cookies?.session;
-  const session = sessions.get(sessionId);
+  const token = req.cookies?.session; // FIX: req.cookies now populated via cookie-parser
+  const session = token ? verifySessionToken(token) : null; // FIX: verify JWT instead of dead Map() lookup
 
   if (!session || session.role !== 'admin') {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -350,14 +375,42 @@ app.post('/api/update-credentials', (req, res) => {
   }
 
   const users = loadUsers();
-  users.admin = { password, role: 'admin' };
+
+  // FIX: original code always overwrote the "admin" key regardless of who was logged in
+  // (users.admin = ...), so renaming the username silently broke login. Now we remove the
+  // old username's record and (re)create the record under the new username, preserving role.
+  const oldUsername = session.username;
+  const role = users[oldUsername]?.role || 'admin';
+
+  if (oldUsername !== username) {
+    delete users[oldUsername];
+  }
+  users[username] = { password, role };
   saveUsers(users);
+
+  // FIX: re-issue the session cookie with the new username baked into the JWT. Without this,
+  // the old cookie still references the old username and the very next request (e.g. a refresh)
+  // would look up a user that no longer exists, effectively logging the admin out mid-session.
+  const newToken = createSessionToken(username, role);
+  res.cookie('session', newToken, {
+    httpOnly: true,
+    maxAge: 24 * 60 * 60 * 1000,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production'
+  });
 
   res.json({ success: true });
 });
 
 app.get('/api/logout', (req, res) => {
-  res.clearCookie('session');
+  // FIX: clearCookie options must match the cookie's original attributes (path/sameSite) for
+  // browsers to reliably remove it; previously it only worked because it accidentally matched
+  // defaults, keeping this explicit now that sameSite/secure are set on login.
+  res.clearCookie('session', {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production'
+  });
   res.redirect('/');
 });
 
